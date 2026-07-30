@@ -1,0 +1,383 @@
+#!/usr/bin/env bash
+# Machine-wide pre-commit guard against secrets/key material/public IPs/PII.
+# Installed via: git config --global core.hooksPath ~/.git-hooks
+# Companion to the "sensitive-data-guard" skill (~/.claude/skills, ~/.cursor/skills-cursor),
+# which handles the semantic checks (customer names, doc prose) this can't do by regex.
+#
+# Two-step flow: first lists every flagged key/value (nothing is touched yet), then asks
+# interactively whether to fix it yourself or let the hook redact the values in place.
+#   - Manual: the commit is blocked immediately, nothing is modified — fix it up and
+#     re-stage, then commit again.
+#   - Overwrite: the offending values are redacted IN PLACE in the working tree with a
+#     generic placeholder (see PLACEHOLDERS below), the files are re-staged, and the
+#     commit is still blocked so the redaction can be reviewed before committing.
+#     Re-running `git commit` after review will pass cleanly since placeholders don't
+#     match the detection patterns anymore.
+#
+# Caveat: redaction rewrites the whole current working-tree copy of a flagged file, then
+# `git add`s it. If you'd only staged part of that file (`git add -p`), the rest of your
+# unstaged edits to it get staged too — check `git status`/`git diff --cached` before
+# your next commit.
+set -uo pipefail
+
+echo "sensitive-data-guard: pre-commit hook running..."
+
+repo_git_dir="$(git rev-parse --git-dir 2>/dev/null)" || exit 0
+
+# Chain to a repo-local hook if one exists on disk (e.g. installed by the Python
+# `pre-commit` framework), since a global core.hooksPath stops git from finding it itself.
+legacy_hook="$repo_git_dir/hooks/pre-commit"
+if [ -x "$legacy_hook" ]; then
+  "$legacy_hook" "$@"
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    exit "$status"
+  fi
+fi
+
+files="$(git diff --cached --name-only --diff-filter=ACM -- . ':(exclude)*.lock' ':(exclude)*lock.json' 2>/dev/null)"
+[ -z "$files" ] && exit 0
+
+hit=0
+QUIET=0
+
+report() {
+  local label="$1" content="$2"
+  hit=1
+  [ "$QUIET" = "1" ] && return 0
+  local masked key
+  masked="$(printf '%s' "$content" | cut -c1-4)****"
+  # Best-effort: pull the field/variable name off a "key: value" or "key=value" line
+  # (env files, YAML, JSON, etc.) so the report says what was redacted, not just where.
+  key="$(printf '%s' "$content" | grep -Eo '^[[:space:]]*"?[A-Za-z0-9_.-]+"?[[:space:]]*[:=]' | head -1 \
+    | sed -E 's/[[:space:]]*[:=][[:space:]]*$//; s/^[[:space:]]*"?//; s/"?$//')"
+  if [ -n "$key" ]; then
+    echo "  [$label] key=\"$key\": $masked"
+  else
+    echo "  [$label] $masked"
+  fi
+}
+
+# scan_line CATEGORY_VAR_PREFIX content — sets file-scoped "needs_<label>=1" flags
+scan_line() {
+  local content="$1"
+  local cred_matches cred_match cred_value cred_quoted ternary_literals ternary_lit
+
+  case "$content" in
+    *"-----BEGIN"*"PRIVATE KEY-----"*) report "private-key" "$content"; need_private_key=1 ;;
+  esac
+
+  grep -Eq 'AKIA[0-9A-Z]{16}' <<<"$content" && { report "aws-key" "$content"; need_aws_key=1; }
+  grep -Eq 'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}' <<<"$content" && { report "jwt-token" "$content"; need_jwt=1; }
+  # The [A-Za-z0-9_-]* after the keyword tolerates suffixed/numbered names like
+  # PASSWORD_1= or STRIPE_SECRET_KEY_2: , not just a bare "password=".
+  cred_matches="$(grep -Eio '(api[_-]?key|secret|token|passwd|password|access[_-]?key)[A-Za-z0-9_-]*[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9/+_.-]{12,}' <<<"$content" || true)"
+  if [ -n "$cred_matches" ]; then
+    while IFS= read -r cred_match; do
+      cred_value="$(printf '%s' "$cred_match" | sed -E 's/^.*[:=][[:space:]]*//')"
+      cred_quoted=0
+      case "$cred_value" in
+        \"*|\'*) cred_quoted=1 ;;
+      esac
+      # An unquoted dotted-identifier chain (data.x.y, var.x, module.x.y, ...) is an HCL/code
+      # reference/expression, not a literal secret — e.g. Terraform's
+      # `token = data.google_client_config.default.access_token`.
+      if [ "$cred_quoted" = "0" ] && [[ "$cred_value" =~ ^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$ ]]; then
+        :
+      else
+        report "credential-assignment" "$content"; need_cred_assignment=1
+      fi
+    done <<<"$cred_matches"
+  fi
+
+  # A hardcoded literal used as a ternary fallback (`x != "" ? x : "literal"`) slips past
+  # the adjacency check above, since the value right after the keyword's operator is the
+  # var/local reference, not the literal. If the line has a credential keyword *and* looks
+  # like a ternary (has both "?" and ":"), check every quoted literal on it too.
+  # No word-boundary here: keyword detection just needs the substring present anywhere
+  # (e.g. inside snake_case names like rabbitmq_password) — \b/[^A-Za-z0-9_] would treat
+  # "_" as a word char and miss almost every real identifier of that shape.
+  if [[ "$content" == *"?"* ]] && [[ "$content" == *":"* ]] \
+    && grep -Eiq '(api[_-]?key|secret|token|passwd|password|access[_-]?key)' <<<"$content"; then
+    ternary_literals="$(grep -Eo '["'"'"'][A-Za-z0-9/+_.-]{12,}["'"'"']' <<<"$content" || true)"
+    if [ -n "$ternary_literals" ]; then
+      while IFS= read -r ternary_lit; do
+        report "credential-assignment" "$content"; need_cred_assignment=1
+      done <<<"$ternary_literals"
+    fi
+  fi
+
+  grep -Eq 'AKCp[a-zA-Z0-9]{10,}' <<<"$content" && { report "jfrog-api-key" "$content"; need_jfrog_api_key=1; }
+  grep -Eq 'cmVmdGtu[A-Za-z0-9]{10,}' <<<"$content" && { report "jfrog-access-token" "$content"; need_jfrog_token=1; }
+
+  ips="$(grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' <<<"$content" || true)"
+  if [ -n "$ips" ]; then
+    while IFS= read -r addr; do
+      case "$addr" in
+        10.*|192.168.*|127.*|0.0.0.0) ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) ;;
+        # RFC 5737 documentation ranges — already-redacted placeholder IPs, leave alone
+        203.0.113.*|198.51.100.*|192.0.2.*) ;;
+        *) report "public-ip" "$content"; need_public_ip=1 ;;
+      esac
+    done <<<"$ips"
+  fi
+
+  emails="$(grep -Eo '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' <<<"$content" || true)"
+  if [ -n "$emails" ]; then
+    while IFS= read -r addr; do
+      case "$addr" in
+        *@jfrog.com|*@example.com|*@test.com|*@localhost) ;;
+        *) report "email" "$content"; need_email=1 ;;
+      esac
+    done <<<"$emails"
+  fi
+}
+
+# redact_file PATH — rewrites confirmed-flagged patterns to generic placeholders.
+# Placeholders are chosen so they no longer match the detection patterns above,
+# so a re-scan of the redacted file comes back clean.
+redact_file() {
+  local file="$1"
+
+  [ "${need_private_key:-0}" = "1" ] && perl -0777 -pi -e \
+    's/-----BEGIN[ A-Z]*PRIVATE KEY-----.*?-----END[ A-Z]*PRIVATE KEY-----/<REDACTED_PRIVATE_KEY_MATERIAL>/gs' \
+    "$file"
+
+  [ "${need_aws_key:-0}" = "1" ] && perl -pi -e \
+    's/AKIA[0-9A-Z]{16}/<REDACTED_AWS_ACCESS_KEY>/g' \
+    "$file"
+
+  [ "${need_jwt:-0}" = "1" ] && perl -pi -e \
+    's/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/<REDACTED_JWT>/g' \
+    "$file"
+
+  # (?:...)[A-Za-z0-9_-]* tolerates suffixed/numbered names (PASSWORD_1=, SECRET_KEY_2:),
+  # matching the scan above — and is captured into $1 along with the bare keyword so the
+  # suffix isn't silently dropped from the rewritten line.
+  [ "${need_cred_assignment:-0}" = "1" ] && perl -pi -e \
+    's/((?:api[_-]?key|secret|token|passwd|password|access[_-]?key)[A-Za-z0-9_-]*)([[:space:]]*[:=][[:space:]]*)(["\x27]?)([A-Za-z0-9\/+_.-]{12,})(["\x27]?)/
+      my ($k,$sep,$q1,$v,$q2) = ($1,$2,$3,$4,$5);
+      ($q1 eq "" && $v =~ m{^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$})
+        ? "$k$sep$q1$v$q2" : "$k$sep${q1}REDACTED$q2"
+    /gie' \
+    "$file"
+
+  # Same ternary-fallback case as the scan above: a hardcoded literal elsewhere on a
+  # credential-keyword line that the adjacency-based substitution just above won't touch.
+  # No \b here either, for the same snake_case reason as the scan-side check.
+  [ "${need_cred_assignment:-0}" = "1" ] && perl -pi -e '
+    if (/(?:api[_-]?key|secret|token|passwd|password|access[_-]?key)/i && /\?/ && /:/) {
+      s/(["\x27])([A-Za-z0-9\/+_.-]{12,})(["\x27])/$1REDACTED$3/g;
+    }
+  ' "$file"
+
+  [ "${need_jfrog_api_key:-0}" = "1" ] && perl -pi -e \
+    's/AKCp[a-zA-Z0-9]{10,}/<REDACTED_JFROG_API_KEY>/g' \
+    "$file"
+
+  [ "${need_jfrog_token:-0}" = "1" ] && perl -pi -e \
+    's/cmVmdGtu[A-Za-z0-9]{10,}/<REDACTED_JFROG_ACCESS_TOKEN>/g' \
+    "$file"
+
+  [ "${need_public_ip:-0}" = "1" ] && perl -pi -e \
+    's/((?:\d{1,3}\.){3}\d{1,3})/my $v=$1; ($v =~ m{^(?:10\.|192\.168\.|127\.|0\.0\.0\.0$|172\.(?:1[6-9]|2\d|3[01])\.|203\.0\.113\.|198\.51\.100\.|192\.0\.2\.)}) ? $v : "203.0.113.10"/ge' \
+    "$file"
+
+  [ "${need_email:-0}" = "1" ] && perl -pi -e \
+    's/([A-Za-z0-9._%+-]+\@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/my $v=$1; ($v =~ m{\@(?:jfrog\.com|example\.com|test\.com|localhost)$}i) ? $v : "user\@example.com"/ge' \
+    "$file"
+}
+
+# process_file PATH MODE — MODE is "scan" (report only) or "redact" (report + rewrite +
+# re-stage). Both modes run the same detection so a "redact" pass reproduces exactly the
+# need_<label> flags the earlier "scan" pass found for this file.
+file_flagged=0
+process_file() {
+  local file="$1" mode="$2"
+  file_flagged=0
+  [ -f "$file" ] || return 0
+
+  need_private_key=0; need_aws_key=0; need_jwt=0; need_cred_assignment=0
+  need_jfrog_api_key=0; need_jfrog_token=0; need_public_ip=0; need_email=0
+
+  local file_added_lines
+  file_added_lines="$(git diff --cached -U0 -- "$file" 2>/dev/null | grep -E '^\+[^+]' || true)"
+  [ -z "$file_added_lines" ] && return 0
+
+  local line
+  while IFS= read -r line; do
+    scan_line "${line#+}"
+  done <<<"$file_added_lines"
+
+  if [ "$need_private_key" = "1" ] || [ "$need_aws_key" = "1" ] || [ "$need_jwt" = "1" ] \
+    || [ "$need_cred_assignment" = "1" ] || [ "$need_jfrog_api_key" = "1" ] || [ "$need_jfrog_token" = "1" ] \
+    || [ "$need_public_ip" = "1" ] || [ "$need_email" = "1" ]; then
+    file_flagged=1
+    if [ "$mode" = "redact" ]; then
+      redact_file "$file"
+      git add -- "$file"
+    fi
+  fi
+}
+
+# print_progress COMPLETED TOTAL LABEL — single-line, carriage-return-updated progress bar.
+# Pure-bash padding (no printf %*s / seq) so it works under bash 3.2 (macOS's default).
+print_progress() {
+  local completed="$1" total="$2" label="$3" width=28
+  local filled empty bar=""
+  filled=$(( completed * width / total ))
+  [ "$filled" -gt "$width" ] && filled=$width
+  empty=$(( width - filled ))
+  local i=0
+  while [ "$i" -lt "$filled" ]; do bar="${bar}#"; i=$((i+1)); done
+  i=0
+  while [ "$i" -lt "$empty" ]; do bar="${bar}-"; i=$((i+1)); done
+  printf '\r%s [%s] %d/%d' "$label" "$bar" "$completed" "$total"
+}
+
+total=0
+for _f in $files; do total=$((total+1)); done
+
+# Scanning forks several grep/sed processes per added line, so for more than a couple of
+# files it's worth spreading files across CPU cores. Redaction/`git add` stays sequential
+# below — concurrent `git add` calls race on .git/index.lock.
+nproc_detected="$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+case "$nproc_detected" in ''|*[!0-9]*) nproc_detected=4 ;; esac
+parallel_jobs=$nproc_detected
+[ "$parallel_jobs" -gt 8 ] && parallel_jobs=8
+[ "$parallel_jobs" -lt 1 ] && parallel_jobs=1
+
+work_dir=""
+if [ "$total" -gt 1 ] && [ "$parallel_jobs" -gt 1 ]; then
+  work_dir="$(mktemp -d "${TMPDIR:-/tmp}/sdg-scan.XXXXXX" 2>/dev/null)" || work_dir=""
+  [ -n "$work_dir" ] && trap 'rm -rf "$work_dir"' EXIT INT TERM
+fi
+
+flagged_file_list=""
+
+if [ -n "$work_dir" ]; then
+  # --- Step 1 (parallel): scan every file in its own background process. Each worker
+  # writes its report text and need_<label> flags to per-index files under $work_dir —
+  # never executed/sourced, only read back with sed/read, so a malicious filename can't
+  # inject shell code into the parent. Nothing in the working tree is modified yet. ---
+  scan_file_worker() {
+    local file="$1" idx="$2"
+    process_file "$file" "scan" > "$work_dir/$idx.report" 2>&1
+    {
+      printf '%s\n' "${file_flagged:-0}"
+    } > "$work_dir/$idx.state" 2>/dev/null
+  }
+
+  idx=0
+  active_pids=""
+  completed=0
+  print_progress 0 "$total" "sensitive-data-guard: scanning"
+  for file in $files; do
+    idx=$((idx+1))
+    while :; do
+      running=0
+      new_active=""
+      for p in $active_pids; do
+        if kill -0 "$p" 2>/dev/null; then
+          running=$((running+1))
+          new_active="$new_active $p"
+        else
+          wait "$p" 2>/dev/null
+          completed=$((completed+1))
+          print_progress "$completed" "$total" "sensitive-data-guard: scanning"
+        fi
+      done
+      active_pids="$new_active"
+      [ "$running" -lt "$parallel_jobs" ] && break
+      sleep 0.05
+    done
+    scan_file_worker "$file" "$idx" &
+    active_pids="$active_pids $!"
+  done
+  while [ -n "$active_pids" ]; do
+    new_active=""
+    for p in $active_pids; do
+      if kill -0 "$p" 2>/dev/null; then
+        new_active="$new_active $p"
+      else
+        wait "$p" 2>/dev/null
+        completed=$((completed+1))
+        print_progress "$completed" "$total" "sensitive-data-guard: scanning"
+      fi
+    done
+    active_pids="$new_active"
+    [ -n "$active_pids" ] && sleep 0.05
+  done
+  printf '\n'
+
+  idx=0
+  for file in $files; do
+    idx=$((idx+1))
+    [ -s "$work_dir/$idx.report" ] && cat "$work_dir/$idx.report"
+    if [ -f "$work_dir/$idx.state" ]; then
+      st_flagged="$(sed -n '1p' "$work_dir/$idx.state")"
+      if [ "$st_flagged" = "1" ]; then
+        hit=1
+        flagged_file_list="$flagged_file_list $file"
+      fi
+    fi
+  done
+  rm -rf "$work_dir"
+  trap - EXIT INT TERM
+else
+  # --- Step 1 (sequential fallback): single file, single core, or temp dir unavailable. ---
+  for file in $files; do
+    process_file "$file" "scan"
+    [ "$file_flagged" = "1" ] && flagged_file_list="$flagged_file_list $file"
+  done
+fi
+
+[ "$hit" -eq 0 ] && exit 0
+
+# --- Step 2: ask how to proceed. ---
+echo ""
+choice=""
+while true; do
+  if ! { printf '%s' "sensitive-data-guard: fix these yourself, or let this hook overwrite (redact) them? [m/o] " > /dev/tty
+         read -r choice < /dev/tty; } 2>/dev/null; then
+    echo "sensitive-data-guard: no interactive terminal available — defaulting to manual fix."
+    choice="m"
+    break
+  fi
+  case "$choice" in
+    [Mm]*) choice="m"; break ;;
+    [Oo]*) choice="o"; break ;;
+    *) echo "Please answer 'm' (manual) or 'o' (overwrite)." > /dev/tty 2>/dev/null ;;
+  esac
+done
+
+if [ "$choice" = "m" ]; then
+  echo ""
+  echo "sensitive-data-guard: leaving files as-is. Fix the above manually, re-stage, and commit again."
+  echo "False positive? Bypass entirely with: git commit --no-verify"
+  exit 1
+fi
+
+# choice = o: redact and re-stage every flagged file. Sequential — `git add` isn't safe
+# to run concurrently (races on .git/index.lock) — but redaction itself is cheap per file.
+QUIET=1
+redacted_files=""
+redact_total=0
+for _f in $flagged_file_list; do redact_total=$((redact_total+1)); done
+redact_done=0
+print_progress 0 "$redact_total" "sensitive-data-guard: redacting"
+for file in $flagged_file_list; do
+  process_file "$file" "redact"
+  redacted_files="$redacted_files  $file"$'\n'
+  redact_done=$((redact_done+1))
+  print_progress "$redact_done" "$redact_total" "sensitive-data-guard: redacting"
+done
+printf '\n'
+
+echo ""
+echo "sensitive-data-guard: redacted the above in place and re-staged:"
+printf '%s' "$redacted_files"
+echo "Review the redaction (git diff --cached), then commit again."
+echo "False positive? Fix it up and re-stage, or bypass entirely with: git commit --no-verify"
+exit 1
