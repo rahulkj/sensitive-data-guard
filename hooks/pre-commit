@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Machine-wide pre-commit guard against secrets/key material/public IPs/PII.
+# Machine-wide pre-commit guard against secrets/key material/public+private IPs/PII.
 # Installed via: git config --global core.hooksPath ~/.git-hooks
 # Companion to the "sensitive-data-guard" skill (~/.claude/skills, ~/.cursor/skills-cursor),
-# which handles the semantic checks (customer names, doc prose) this can't do by regex.
+# which handles semantic checks (a company name in free-form prose, doc content) that no
+# fixed pattern can reliably catch. Customer-name matching here is mechanical and exact:
+# it only catches names present in CUSTOMER_LIST_FILE below — anything not on that list
+# needs the skill's semantic read instead.
 #
 # Two-step flow: first lists every flagged key/value (nothing is touched yet), then asks
 # interactively whether to fix it yourself or let the hook redact the values in place.
@@ -37,6 +40,18 @@ fi
 
 files="$(git diff --cached --name-only --diff-filter=ACM -- . ':(exclude)*.lock' ':(exclude)*lock.json' 2>/dev/null)"
 [ -z "$files" ] && exit 0
+
+# Build a single case-insensitive alternation from CUSTOMER_LIST_FILE (one name per line,
+# blank lines and #-comments ignored). Exact/substring match only — this can't do the
+# semantic "is this prose about a customer" read the companion skill does.
+CUSTOMER_LIST_FILE="${SDG_CUSTOMER_LIST_FILE:-$HOME/.claude/sensitive-data-guard-customers.txt}"
+customer_pattern=""
+if [ -s "$CUSTOMER_LIST_FILE" ]; then
+  customer_pattern="$(grep -Ev '^[[:space:]]*(#|$)' "$CUSTOMER_LIST_FILE" 2>/dev/null \
+    | sed -E 's/[][\.^$*+?(){}|\\]/\\&/g' \
+    | paste -sd '|' - 2>/dev/null)"
+fi
+export SDG_CUSTOMER_PATTERN="$customer_pattern"
 
 hit=0
 QUIET=0
@@ -114,10 +129,12 @@ scan_line() {
   if [ -n "$ips" ]; then
     while IFS= read -r addr; do
       case "$addr" in
-        10.*|192.168.*|127.*|0.0.0.0) ;;
-        172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) ;;
-        # RFC 5737 documentation ranges — already-redacted placeholder IPs, leave alone
+        127.*|0.0.0.0) ;;  # loopback / any-address — never customer-identifying
+        # RFC 5737 documentation ranges — already-redacted public-IP placeholder, leave alone
         203.0.113.*|198.51.100.*|192.0.2.*) ;;
+        10.0.0.1) ;;  # already-redacted private-IP placeholder, leave alone
+        10.*|192.168.*) report "private-ip" "$content"; need_private_ip=1 ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) report "private-ip" "$content"; need_private_ip=1 ;;
         *) report "public-ip" "$content"; need_public_ip=1 ;;
       esac
     done <<<"$ips"
@@ -131,6 +148,11 @@ scan_line() {
         *) report "email" "$content"; need_email=1 ;;
       esac
     done <<<"$emails"
+  fi
+
+  # Mechanical/exact-match only — see CUSTOMER_LIST_FILE note at the top of this file.
+  if [ -n "${SDG_CUSTOMER_PATTERN:-}" ] && grep -Eiq "$SDG_CUSTOMER_PATTERN" <<<"$content"; then
+    report "customer-name" "$content"; need_customer_name=1
   fi
 }
 
@@ -180,12 +202,26 @@ redact_file() {
     's/cmVmdGtu[A-Za-z0-9]{10,}/<REDACTED_JFROG_ACCESS_TOKEN>/g' \
     "$file"
 
+  # "Leave alone" set here is private/loopback/placeholder — this pass only ever touches
+  # genuinely public addresses (need_private_ip below handles the private ranges).
   [ "${need_public_ip:-0}" = "1" ] && perl -pi -e \
     's/((?:\d{1,3}\.){3}\d{1,3})/my $v=$1; ($v =~ m{^(?:10\.|192\.168\.|127\.|0\.0\.0\.0$|172\.(?:1[6-9]|2\d|3[01])\.|203\.0\.113\.|198\.51\.100\.|192\.0\.2\.)}) ? $v : "203.0.113.10"/ge' \
     "$file"
 
+  # Mirror image of the pass above: only touches 10.*/172.16-31.*/192.168.* addresses,
+  # and leaves the private-IP placeholder itself (10.0.0.1) alone so a re-scan is clean.
+  [ "${need_private_ip:-0}" = "1" ] && perl -pi -e \
+    's/((?:\d{1,3}\.){3}\d{1,3})/my $v=$1; ($v eq "10.0.0.1" || $v !~ m{^(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)}) ? $v : "10.0.0.1"/ge' \
+    "$file"
+
   [ "${need_email:-0}" = "1" ] && perl -pi -e \
     's/([A-Za-z0-9._%+-]+\@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/my $v=$1; ($v =~ m{\@(?:jfrog\.com|example\.com|test\.com|localhost)$}i) ? $v : "user\@example.com"/ge' \
+    "$file"
+
+  # Exact/case-insensitive match against CUSTOMER_LIST_FILE — via $ENV so a customer name
+  # containing shell/regex-special characters can't break out of the perl script text.
+  [ "${need_customer_name:-0}" = "1" ] && [ -n "${SDG_CUSTOMER_PATTERN:-}" ] && perl -pi -e \
+    's{(?:$ENV{SDG_CUSTOMER_PATTERN})}{<REDACTED_CUSTOMER_NAME>}gi' \
     "$file"
 }
 
@@ -199,7 +235,8 @@ process_file() {
   [ -f "$file" ] || return 0
 
   need_private_key=0; need_aws_key=0; need_jwt=0; need_cred_assignment=0
-  need_jfrog_api_key=0; need_jfrog_token=0; need_public_ip=0; need_email=0
+  need_jfrog_api_key=0; need_jfrog_token=0; need_public_ip=0; need_private_ip=0
+  need_email=0; need_customer_name=0
 
   local file_added_lines
   file_added_lines="$(git diff --cached -U0 -- "$file" 2>/dev/null | grep -E '^\+[^+]' || true)"
@@ -212,7 +249,8 @@ process_file() {
 
   if [ "$need_private_key" = "1" ] || [ "$need_aws_key" = "1" ] || [ "$need_jwt" = "1" ] \
     || [ "$need_cred_assignment" = "1" ] || [ "$need_jfrog_api_key" = "1" ] || [ "$need_jfrog_token" = "1" ] \
-    || [ "$need_public_ip" = "1" ] || [ "$need_email" = "1" ]; then
+    || [ "$need_public_ip" = "1" ] || [ "$need_private_ip" = "1" ] || [ "$need_email" = "1" ] \
+    || [ "$need_customer_name" = "1" ]; then
     file_flagged=1
     if [ "$mode" = "redact" ]; then
       redact_file "$file"

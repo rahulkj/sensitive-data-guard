@@ -1,0 +1,26 @@
+---
+description: Guard against leaking customer-identifying data (secrets, IPs, customer names) before commit/share
+alwaysApply: true
+---
+
+Before committing, pushing, opening a PR, or writing content into a doc/export meant to
+leave this machine, check the change for:
+
+- Secrets/credentials (API keys, tokens, passwords, private key material)
+- Public *and* private IPv4 addresses (except loopback `127.*` / `0.0.0.0`)
+- Customer/company names — check `~/.claude/sensitive-data-guard-customers.txt` (exact
+  match) *and* read the actual content for names not on that list (git remote, README,
+  config, comments) — the list won't catch everything, context reasoning will
+- Personal names/emails/phone numbers not on an internal allowlist domain
+
+If something's found: for secrets/IPs/emails, redact in place with a generic
+placeholder and say what you changed. For customer/personal names, either confirm the
+replacement with the user first (normal commit flow) or, if the user explicitly asked
+to scan-and-anonymize a whole repo/folder, anonymize directly with one consistent
+placeholder per distinct name for the whole run (e.g. "Customer A", "Customer B") and
+report a summary — don't stop per-instance in that mode.
+
+Full detail: the `sensitive-data-guard` skill at `~/.agent/skills/sensitive-data-guard`
+(symlinked into this tool's skills directory too). A machine-wide git pre-commit hook
+also mechanically catches secrets/IPs/denylisted names on every `git commit`,
+independent of this rule.
