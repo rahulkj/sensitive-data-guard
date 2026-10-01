@@ -57,33 +57,31 @@ hit=0
 QUIET=0
 
 report() {
-  local label="$1" content="$2"
+  local label="$1" content="$2" file="$3"
   hit=1
   [ "$QUIET" = "1" ] && return 0
   local masked key
   masked="$(printf '%s' "$content" | cut -c1-4)****"
-  # Best-effort: pull the field/variable name off a "key: value" or "key=value" line
-  # (env files, YAML, JSON, etc.) so the report says what was redacted, not just where.
   key="$(printf '%s' "$content" | grep -Eo '^[[:space:]]*"?[A-Za-z0-9_.-]+"?[[:space:]]*[:=]' | head -1 \
     | sed -E 's/[[:space:]]*[:=][[:space:]]*$//; s/^[[:space:]]*"?//; s/"?$//')"
   if [ -n "$key" ]; then
-    echo "  [$label] key=\"$key\": $masked"
+    echo "  [$label] $file: key=\"$key\": $masked"
   else
-    echo "  [$label] $masked"
+    echo "  [$label] $file: $masked"
   fi
 }
 
-# scan_line CATEGORY_VAR_PREFIX content — sets file-scoped "needs_<label>=1" flags
+# scan_line content file — sets file-scoped "needs_<label>=1" flags
 scan_line() {
-  local content="$1"
+  local content="$1" file="$2"
   local cred_matches cred_match cred_value cred_quoted ternary_literals ternary_lit
 
   case "$content" in
-    *"-----BEGIN"*"PRIVATE KEY-----"*) report "private-key" "$content"; need_private_key=1 ;;
+    *"-----BEGIN"*"PRIVATE KEY-----"*) report "private-key" "$content" "$file"; need_private_key=1 ;;
   esac
 
-  grep -Eq 'AKIA[0-9A-Z]{16}' <<<"$content" && { report "aws-key" "$content"; need_aws_key=1; }
-  grep -Eq 'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}' <<<"$content" && { report "jwt-token" "$content"; need_jwt=1; }
+  grep -Eq 'AKIA[0-9A-Z]{16}' <<<"$content" && { report "aws-key" "$content" "$file"; need_aws_key=1; }
+  grep -Eq 'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}' <<<"$content" && { report "jwt-token" "$content" "$file"; need_jwt=1; }
   # The [A-Za-z0-9_-]* after the keyword tolerates suffixed/numbered names like
   # PASSWORD_1= or STRIPE_SECRET_KEY_2: , not just a bare "password=".
   cred_matches="$(grep -Eio '(api[_-]?key|secret|token|passwd|password|access[_-]?key)[A-Za-z0-9_-]*[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9/+_.-]{12,}' <<<"$content" || true)"
@@ -100,7 +98,7 @@ scan_line() {
       if [ "$cred_quoted" = "0" ] && [[ "$cred_value" =~ ^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$ ]]; then
         :
       else
-        report "credential-assignment" "$content"; need_cred_assignment=1
+        report "credential-assignment" "$content" "$file"; need_cred_assignment=1
       fi
     done <<<"$cred_matches"
   fi
@@ -117,25 +115,24 @@ scan_line() {
     ternary_literals="$(grep -Eo '["'"'"'][A-Za-z0-9/+_.-]{12,}["'"'"']' <<<"$content" || true)"
     if [ -n "$ternary_literals" ]; then
       while IFS= read -r ternary_lit; do
-        report "credential-assignment" "$content"; need_cred_assignment=1
+        report "credential-assignment" "$content" "$file"; need_cred_assignment=1
       done <<<"$ternary_literals"
     fi
   fi
 
-  grep -Eq 'AKCp[a-zA-Z0-9]{10,}' <<<"$content" && { report "jfrog-api-key" "$content"; need_jfrog_api_key=1; }
-  grep -Eq 'cmVmdGtu[A-Za-z0-9]{10,}' <<<"$content" && { report "jfrog-access-token" "$content"; need_jfrog_token=1; }
+  grep -Eq 'AKCp[a-zA-Z0-9]{10,}' <<<"$content" && { report "jfrog-api-key" "$content" "$file"; need_jfrog_api_key=1; }
+  grep -Eq 'cmVmdGtu[A-Za-z0-9]{10,}' <<<"$content" && { report "jfrog-access-token" "$content" "$file"; need_jfrog_token=1; }
 
   ips="$(grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' <<<"$content" || true)"
   if [ -n "$ips" ]; then
     while IFS= read -r addr; do
       case "$addr" in
-        127.*|0.0.0.0) ;;  # loopback / any-address — never customer-identifying
-        # RFC 5737 documentation ranges — already-redacted public-IP placeholder, leave alone
+        127.*|0.0.0.0) ;;
         203.0.113.*|198.51.100.*|192.0.2.*) ;;
-        10.0.0.1) ;;  # already-redacted private-IP placeholder, leave alone
-        10.*|192.168.*) report "private-ip" "$content"; need_private_ip=1 ;;
-        172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) report "private-ip" "$content"; need_private_ip=1 ;;
-        *) report "public-ip" "$content"; need_public_ip=1 ;;
+        10.0.0.1) ;;
+        10.*|192.168.*) report "private-ip" "$content" "$file"; need_private_ip=1 ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) report "private-ip" "$content" "$file"; need_private_ip=1 ;;
+        *) report "public-ip" "$content" "$file"; need_public_ip=1 ;;
       esac
     done <<<"$ips"
   fi
@@ -145,14 +142,13 @@ scan_line() {
     while IFS= read -r addr; do
       case "$addr" in
         *@jfrog.com|*@example.com|*@test.com|*@localhost) ;;
-        *) report "email" "$content"; need_email=1 ;;
+        *) report "email" "$content" "$file"; need_email=1 ;;
       esac
     done <<<"$emails"
   fi
 
-  # Mechanical/exact-match only — see CUSTOMER_LIST_FILE note at the top of this file.
   if [ -n "${SDG_CUSTOMER_PATTERN:-}" ] && grep -Eiq "$SDG_CUSTOMER_PATTERN" <<<"$content"; then
-    report "customer-name" "$content"; need_customer_name=1
+    report "customer-name" "$content" "$file"; need_customer_name=1
   fi
 }
 
@@ -244,7 +240,7 @@ process_file() {
 
   local line
   while IFS= read -r line; do
-    scan_line "${line#+}"
+    scan_line "${line#+}" "$file"
   done <<<"$file_added_lines"
 
   if [ "$need_private_key" = "1" ] || [ "$need_aws_key" = "1" ] || [ "$need_jwt" = "1" ] \
@@ -301,10 +297,8 @@ if [ -n "$work_dir" ]; then
   # inject shell code into the parent. Nothing in the working tree is modified yet. ---
   scan_file_worker() {
     local file="$1" idx="$2"
-    process_file "$file" "scan" > "$work_dir/$idx.report" 2>&1
-    {
-      printf '%s\n' "${file_flagged:-0}"
-    } > "$work_dir/$idx.state" 2>/dev/null
+    process_file "$file" "scan" >> "$work_dir/$idx.report" 2>&1
+    printf '%s\n' "${file_flagged:-0}" > "$work_dir/$idx.state" 2>/dev/null
   }
 
   idx=0
@@ -313,7 +307,7 @@ if [ -n "$work_dir" ]; then
   print_progress 0 "$total" "sensitive-data-guard: scanning"
   for file in $files; do
     idx=$((idx+1))
-    while :; do
+    while [ $(printf '%s' "$active_pids" | wc -w) -ge "$parallel_jobs" ]; do
       running=0
       new_active=""
       for p in $active_pids; do
@@ -327,8 +321,7 @@ if [ -n "$work_dir" ]; then
         fi
       done
       active_pids="$new_active"
-      [ "$running" -lt "$parallel_jobs" ] && break
-      sleep 0.05
+      [ $(printf '%s' "$active_pids" | wc -w) -ge "$parallel_jobs" ] && sleep 0.01 || break
     done
     scan_file_worker "$file" "$idx" &
     active_pids="$active_pids $!"
@@ -345,7 +338,7 @@ if [ -n "$work_dir" ]; then
       fi
     done
     active_pids="$new_active"
-    [ -n "$active_pids" ] && sleep 0.05
+    [ -n "$active_pids" ] && sleep 0.01
   done
   printf '\n'
 
@@ -373,7 +366,16 @@ fi
 
 [ "$hit" -eq 0 ] && exit 0
 
-# --- Step 2: ask how to proceed. ---
+# --- Step 2: show summary of flagged files. ---
+echo ""
+echo "sensitive-data-guard: flagged files requiring attention:"
+if [ -n "$flagged_file_list" ]; then
+  for f in $flagged_file_list; do echo "  • $f"; done
+else
+  for f in $files; do echo "  • $f"; done
+fi
+
+# --- Step 3: ask how to proceed. ---
 echo ""
 choice=""
 while true; do
@@ -416,6 +418,7 @@ printf '\n'
 echo ""
 echo "sensitive-data-guard: redacted the above in place and re-staged:"
 printf '%s' "$redacted_files"
+echo ""
 echo "Review the redaction (git diff --cached), then commit again."
 echo "False positive? Fix it up and re-stage, or bypass entirely with: git commit --no-verify"
 exit 1
